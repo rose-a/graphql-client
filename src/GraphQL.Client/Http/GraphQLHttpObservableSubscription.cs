@@ -1,7 +1,10 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
+using System.Net.Http;
 using System.Net.WebSockets;
 using System.Reactive.Linq;
+using System.Reactive.Subjects;
 using System.Reactive.Threading.Tasks;
 using System.Runtime.Serialization;
 using System.Text;
@@ -27,7 +30,9 @@ namespace GraphQL.Client.Http {
 		private readonly ArraySegment<byte> arraySegment;
 		private readonly CancellationTokenSource _cancellationTokenSource;
 
-		private GraphQLHttpObservableSubscription(Uri webSocketUri, GraphQLRequest graphQLRequest, CancellationToken cancellationToken = default) {
+		private GraphQLHttpObservableSubscription(Uri webSocketUri, GraphQLRequest graphQLRequest, CancellationToken cancellationToken = default)
+		{
+			Debug.WriteLine($"creating new subscription handler {this.GetHashCode()}");
 			_cancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
 			_cancellationTokenSource.Token.Register(Dispose);
 			this.webSocketUri = webSocketUri;
@@ -67,8 +72,14 @@ namespace GraphQL.Client.Http {
 
 		public async Task CloseAsync(CancellationToken cancellationToken = default)
 		{
+			if (this.clientWebSocket.State != WebSocketState.Open &&
+			    this.clientWebSocket.State != WebSocketState.CloseReceived &&
+			    this.clientWebSocket.State != WebSocketState.CloseSent)
+				return;
+
 			Debug.WriteLine($"closing websocket on subscription {this.GetHashCode()}");
-			if (this.clientWebSocket.State == WebSocketState.Open) {
+			if (this.clientWebSocket.State == WebSocketState.Open)
+			{
 				await SendCloseMessageAsync(cancellationToken).ConfigureAwait(false);
 			}
 			await this.clientWebSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "", cancellationToken).ConfigureAwait(false);
@@ -110,19 +121,32 @@ namespace GraphQL.Client.Http {
 		public void Dispose()
 		{
 			// Async disposal as recommended by Stephen Cleary (https://blog.stephencleary.com/2013/03/async-oop-6-disposal.html)
-			if(Disposed == null) Disposed = DisposeAsync();
+			lock (_disposedLocker)
+			{
+				if (Disposed == null) Disposed = DisposeAsync();
+			}
 		}
 
 		public Task Disposed { get; private set; }
+		private object _disposedLocker = new object();
 
 		private async Task DisposeAsync()
 		{
 			Debug.WriteLine($"disposing subscription {this.GetHashCode()}...");
-			if(!_cancellationTokenSource.IsCancellationRequested)
-				_cancellationTokenSource.Cancel();
-			await CloseAsync().ConfigureAwait(false);
-			clientWebSocket?.Dispose();
-			_cancellationTokenSource.Dispose();
+			//Debug.WriteLine($"Dispose {this.GetHashCode()} StackTrace: {Environment.StackTrace}");
+			try
+			{
+				if (!_cancellationTokenSource.IsCancellationRequested)
+					_cancellationTokenSource.Cancel();
+				await CloseAsync().ConfigureAwait(false);
+				this.clientWebSocket?.Dispose();
+				this._cancellationTokenSource.Dispose();
+			}
+			catch (Exception e)
+			{
+				Console.WriteLine(e);
+				throw;
+			}
 			Debug.WriteLine($"subscription {this.GetHashCode()} disposed");
 		}
 
@@ -130,14 +154,51 @@ namespace GraphQL.Client.Http {
 
 		#region Static Factories
 
-		public static IObservable<GraphQLResponse> GetSubscriptionStream(Uri webSocketUri, GraphQLRequest graphQLRequest, CancellationToken cancellationToken = default)
+		public static List<WebSocketError> PropagatingWebSocketErrors = new List<WebSocketError>
 		{
-			return Observable.Using(
-				token => CreateSubscription(webSocketUri, graphQLRequest, cancellationToken),
-				InitializeSubscription
-				).Publish().RefCount();
-		}
+			WebSocketError.Success
+		};
 
+		public static IObservable<GraphQLResponse> GetSubscriptionStream(
+			Uri webSocketUri,
+			GraphQLRequest graphQLRequest,
+			Action<WebSocketException> onWebSocketException,
+			CancellationToken cancellationToken = default)
+		{
+			return Observable
+				// create deferred observable using a GraphQLHttpObservableSubscription instance
+				.Defer(() => Observable.Using(
+					token => CreateSubscription(webSocketUri, graphQLRequest, cancellationToken),
+					InitializeSubscription
+				))
+				// wrap results in tuple
+				.Select(response => new Tuple<GraphQLResponse, Exception>(response, null))
+				// evaluate thrown exceptions
+				.Catch<Tuple<GraphQLResponse, Exception>, Exception>(e =>
+				{
+					if (e is WebSocketException webSocketException)
+					{
+						// invoke onWebSocketException action to propagate the websocket exception outside of the stream
+						onWebSocketException?.Invoke(webSocketException);
+						// re-throw exception to be caught by Retry()
+						return cancellationToken.IsCancellationRequested
+							? Observable.Empty<Tuple<GraphQLResponse, Exception>>()
+							: Observable.Throw<Tuple<GraphQLResponse, Exception>>(e);
+					}
+
+					// wrap all other exceptions to be propagated behind retry
+					return Observable.Return(new Tuple<GraphQLResponse, Exception>(null, e));
+				})
+				// re create subscription stream for re-thrown exceptions
+				.Retry()
+				// unwrap and push results or throw wrapped exceptions
+				.SelectMany(t =>
+					t.Item2 == null
+						? Observable.Return(t.Item1)
+						: Observable.Throw<GraphQLResponse>(t.Item2))
+				// transform to hot observable and auto-connect
+				.Publish().RefCount();
+		}
 
 		private static Task<GraphQLHttpObservableSubscription> CreateSubscription(Uri webSocketUri, GraphQLRequest graphQLRequest, CancellationToken cancellationToken = default)
 		{
@@ -149,7 +210,10 @@ namespace GraphQL.Client.Http {
 		{
 			await observableSubscription.ConnectAsync(cancelToken).ConfigureAwait(false);
 			await observableSubscription.SendInitialMessageAsync(cancelToken).ConfigureAwait(false);
-			return Observable.Defer(() => observableSubscription.ReceiveResultAsync().ToObservable()).Repeat();
+			return Observable.Defer(() => observableSubscription.ReceiveResultAsync().ToObservable())
+				.Repeat()
+				// complete sequence on OperationCanceledException, this is triggered by the cancellation token
+				.Catch<GraphQLResponse, OperationCanceledException>(exception => Observable.Empty<GraphQLResponse>());
 		}
 
 		#endregion

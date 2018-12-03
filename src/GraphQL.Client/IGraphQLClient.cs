@@ -1,4 +1,5 @@
 using System;
+using System.Net.WebSockets;
 using System.Threading;
 using System.Threading.Tasks;
 using GraphQL.Common.Request;
@@ -37,7 +38,7 @@ namespace GraphQL.Client {
 		Task<IGraphQLSubscriptionResult> SendSubscribeAsync(GraphQLRequest request, CancellationToken cancellationToken = default);
 
 		[Obsolete("EXPERIMENTAL")]
-		IObservable<GraphQLResponse> CreateSubscriptionStream(GraphQLRequest request);
+		IObservable<GraphQLResponse> CreateSubscriptionStream(GraphQLRequest request, Action<WebSocketException> onWebSocketException = null);
 	}
 
 }

@@ -1,6 +1,7 @@
 using System;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Net.WebSockets;
 using System.Threading;
 using System.Threading.Tasks;
 using GraphQL.Client.Http.Internal;
@@ -141,9 +142,9 @@ namespace GraphQL.Client.Http {
 		}
 
 		[Obsolete("EXPERIMENTAL API")]
-		public IObservable<GraphQLResponse> CreateSubscriptionStream(GraphQLRequest request)
+		public IObservable<GraphQLResponse> CreateSubscriptionStream(GraphQLRequest request, Action<WebSocketException> onWebSocketException = null)
 		{
-			var observable = GraphQLHttpObservableSubscription.GetSubscriptionStream(_getWebSocketUri(), request, _cancellationTokenSource.Token);
+			var observable = GraphQLHttpObservableSubscription.GetSubscriptionStream(_getWebSocketUri(), request, onWebSocketException, _cancellationTokenSource.Token);
 			return observable;
 		}
 
